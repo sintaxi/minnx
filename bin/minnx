@@ -7,6 +7,7 @@
 var Group = require('../');
 var minimist = require('minimist');
 var pkg = require('../package');
+var spawn = require('child_process').spawnSync;
 var path = require('path');
 var s = require('printf');
 var ms = require('ms');
@@ -48,8 +49,20 @@ if (argv.help) {
   console.log('    start   [names]  start all or specified processes');
   console.log('    stop    [names]  stop all or specified processes');
   console.log('    restart [names]  restart all or specified processes');
+  console.log('    chat    [name]   attach to a running process');
+  console.log('    send    <name> <message>  send a message to a process');
+  console.log('    ask     <name> <message>  send a message and print response');
   console.log();
   process.exit(0);
+}
+
+// check for tmux
+
+try {
+  require('child_process').execSync('tmux -V', { stdio: 'ignore' });
+} catch (e) {
+  console.error('minnx requires tmux. Install with: brew install tmux');
+  process.exit(1);
 }
 
 // command
@@ -72,12 +85,10 @@ var conf = Group.parseConfig(confFile);
 var dir = path.dirname(argv.config);
 process.chdir(dir);
 
-// ensure dirs exist
+// ensure log dir exists
 
 conf.logs = conf.logs || 'logs';
-conf.pids = conf.pids || 'pids';
 mkdir(conf.logs);
-mkdir(conf.pids);
 
 // group
 
@@ -89,6 +100,9 @@ switch (cmd) {
   case 'stop': return stop(argv._);
   case 'start': return start(argv._);
   case 'restart': return restart(argv._);
+  case 'chat': return chat(argv._[0]);
+  case 'send': return send(argv._[0], argv._.slice(1).join(' '));
+  case 'ask': return ask(argv._[0], argv._.slice(1).join(' '));
   case 'status': return argv.json ? jsonstatus() : status();
   default:
     console.error('unknown command "' + cmd + '", run `minnx --help` for usage');
@@ -96,7 +110,7 @@ switch (cmd) {
 }
 
 /**
- * Start pros.
+ * Start procs.
  */
 
 function start(procs, fn) {
@@ -132,7 +146,6 @@ function stop(procs, fn) {
     console.log(s('\033[36m%15s\033[m : standby : %s', proc.name, proc.pid || 0));
   });
 
-  // changed from `SIGQUIT`
   group.stop(procs, null, function(err){
     if (err) throw err;
     if (fn) return fn();
@@ -154,6 +167,134 @@ function restart(procs) {
 }
 
 /**
+ * Attach to a running process.
+ */
+
+function chat(name) {
+  var session = group.session || 'minnx';
+
+  // no name — attach to the session (navigate windows freely)
+  if (!name) {
+    spawn('tmux', ['attach', '-t', session], { stdio: 'inherit' });
+    return;
+  }
+
+  // validate the name exists in config
+  var proc = group.procs.filter(function(p) { return p.name === name; })[0];
+  if (!proc) {
+    console.error('unknown process "' + name + '"');
+    process.exit(1);
+  }
+
+  if (!proc.alive()) {
+    console.error('"' + name + '" is not running');
+    process.exit(1);
+  }
+
+  var target = session + ':' + name;
+  spawn('tmux', ['attach', '-t', target], { stdio: 'inherit' });
+}
+
+/**
+ * Send a message to a running process.
+ */
+
+function send(name, message) {
+  var session = group.session || 'minnx';
+
+  if (!name || !message) {
+    console.error('usage: minnx send <name> <message>');
+    process.exit(1);
+  }
+
+  var proc = group.procs.filter(function(p) { return p.name === name; })[0];
+  if (!proc) {
+    console.error('unknown process "' + name + '"');
+    process.exit(1);
+  }
+
+  if (!proc.alive()) {
+    console.error('"' + name + '" is not running');
+    process.exit(1);
+  }
+
+  var target = session + ':' + name;
+  var exec = require('child_process').execSync;
+  exec('tmux send-keys -t ' + shellQuote(target) + ' ' + shellQuote(message) + ' Enter');
+}
+
+/**
+ * Send a message and print the streaming response.
+ */
+
+function ask(name, message) {
+  var net = require('net');
+  var session = group.session || 'minnx';
+
+  if (!name || !message) {
+    console.error('usage: minnx ask <name> <message>');
+    process.exit(1);
+  }
+
+  var proc = group.procs.filter(function(p) { return p.name === name; })[0];
+  if (!proc) {
+    console.error('unknown process "' + name + '"');
+    process.exit(1);
+  }
+
+  if (!proc.alive()) {
+    console.error('"' + name + '" is not running');
+    process.exit(1);
+  }
+
+  var socketPath = path.resolve(path.join('sockets', name + '.sock'));
+  var client = net.connect(socketPath, function() {
+    client.write(JSON.stringify({ type: 'prompt', message: message }) + '\n');
+  });
+
+  var buf = '';
+  client.on('data', function(chunk) {
+    buf += chunk.toString();
+    var lines = buf.split('\n');
+    buf = lines.pop();
+
+    lines.forEach(function(line) {
+      if (!line.trim()) return;
+      try {
+        var event = JSON.parse(line);
+        if (event.type === 'text_delta') {
+          process.stdout.write(event.delta);
+        } else if (event.type === 'done') {
+          process.stdout.write('\n');
+          client.end();
+        } else if (event.type === 'error') {
+          console.error(event.message);
+          client.end();
+          process.exit(1);
+        }
+      } catch (e) {}
+    });
+  });
+
+  client.on('error', function(err) {
+    if (err.code === 'ENOENT') {
+      console.error('"' + name + '" does not have a socket (is it a pi agent?)');
+    } else {
+      console.error('connection error: ' + err.message);
+    }
+    process.exit(1);
+  });
+}
+
+/**
+ * Shell-quote a string.
+ */
+
+function shellQuote(str) {
+  return "'" + str.replace(/'/g, "'\\''") + "'";
+}
+
+/**
  * Output json status.
  */
 
@@ -170,7 +311,8 @@ function jsonstatus() {
     procs[proc.name] = {
       state: state,
       pid: proc.pid,
-      uptime: uptime
+      uptime: uptime,
+      stats: proc.stats()
     };
   });
 
@@ -192,7 +334,13 @@ function status() {
         break;
       case 'alive':
         var uptime = ms(Date.now() - proc.mtime(), { long: true });
-        console.log(s('\033[32m%15s\033[m : %s : %s : %s', proc.name, proc.state(), proc.pid, uptime));
+        var stats = proc.stats();
+        if (stats && stats.model) {
+          var cost = stats.cost ? ' : $' + stats.cost.toFixed(4) : '';
+          console.log(s('\033[32m%15s\033[m : \033[90m%s\033[m : %s : %s : %s%s', proc.name, stats.model, proc.state(), proc.pid, uptime, cost));
+        } else {
+          console.log(s('\033[32m%15s\033[m : %s : %s : %s', proc.name, proc.state(), proc.pid, uptime));
+        }
         break;
       case 'dead':
         console.log(s('\033[31m%15s\033[m : %s', proc.name, proc.state(), proc.pid || 0));

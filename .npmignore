@@ -1,6 +1,5 @@
 test/
 logs/
-pids/
 minnx.conf
 .DS_Store
 *.swp
