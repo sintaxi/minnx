@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { execSync } from "child_process";
 import { join, dirname } from "path";
 import { createServer, type Socket } from "net";
 
@@ -7,7 +8,8 @@ export default function (pi: ExtensionAPI) {
   const name = process.env.MINNX_PROC_NAME;
   if (!name) return;
 
-  const baseDir = process.cwd();
+  const session = process.env.MINNX_SESSION;
+  const baseDir = process.env.MINNX_BASE_DIR || process.cwd();
   const statsFile = join(baseDir, "stats", name + ".json");
   const socketPath = join(baseDir, "sockets", name + ".sock");
 
@@ -19,6 +21,18 @@ export default function (pi: ExtensionAPI) {
   let totalCost = 0;
   let totalInput = 0;
   let totalOutput = 0;
+  let state = "idle";
+
+  // Write initial stats on startup so every pi process has a stats file
+  pi.on("session_start", async (_event, ctx) => {
+    state = "idle";
+    writeStats(ctx.model?.id || null);
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    state = "working";
+    writeStats(ctx.model?.id || null);
+  });
 
   pi.on("agent_end", async (event, ctx) => {
     for (const msg of event.messages) {
@@ -29,16 +43,52 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // determine state from last assistant message's stopReason
+    const lastAssistant = [...event.messages].reverse().find(m => m.role === "assistant");
+    if (lastAssistant && "stopReason" in lastAssistant) {
+      switch (lastAssistant.stopReason) {
+        case "error":   state = "error";   break;
+        case "aborted": state = "aborted"; break;
+        case "length":  state = "stuck";   break;
+        default:        state = "idle";    break;
+      }
+    } else {
+      state = "idle";
+    }
+
     writeStats(ctx.model?.id || null);
   });
+
+  // State indicator for tmux window name
+  const indicators: Record<string, string> = {
+    idle:    "",
+    working: "•",
+    error:   "◦",
+    aborted: "◦",
+    stuck:   "◦",
+  };
+
+  let currentWindowName = name;
+
+  function updateWindowName() {
+    if (!session) return;
+    const icon = indicators[state] || "";
+    const newName = icon ? icon + name : name;
+    try {
+      execSync(`tmux rename-window -t ${JSON.stringify(session + ":" + currentWindowName)} ${JSON.stringify(newName)}`, { stdio: "pipe" });
+      currentWindowName = newName;
+    } catch (e) {}
+  }
 
   // Write stats helper
   function writeStats(model: string | null) {
     writeFileSync(statsFile, JSON.stringify({
       model: model,
       cost: Math.round(totalCost * 10000) / 10000,
-      tokens: { input: totalInput, output: totalOutput }
+      tokens: { input: totalInput, output: totalOutput },
+      state: state
     }) + "\n");
+    updateWindowName();
   }
 
   // Update stats file when model changes

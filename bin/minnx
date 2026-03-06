@@ -50,8 +50,8 @@ if (argv.help) {
   console.log('    stop    [names]  stop all or specified processes');
   console.log('    restart [names]  restart all or specified processes');
   console.log('    chat    [name]   attach to a running process');
-  console.log('    send    <name> <message>  send a message to a process');
-  console.log('    ask     <name> <message>  send a message and print response');
+  console.log('    send    [name] <message>  send a message to one or all agents');
+  console.log('    ask     [name] <message>  ask one or all agents and print response');
   console.log();
   process.exit(0);
 }
@@ -80,6 +80,14 @@ try {
 }
 var conf = Group.parseConfig(confFile);
 
+// resolve agent dirs before chdir (relative to cwd, not config dir)
+Object.keys(conf.processes).forEach(function(key) {
+  var proc = conf.processes[key];
+  if (proc.dir) {
+    proc.dir = path.resolve(proc.dir);
+  }
+});
+
 // cd
 
 var dir = path.dirname(argv.config);
@@ -101,8 +109,8 @@ switch (cmd) {
   case 'start': return start(argv._);
   case 'restart': return restart(argv._);
   case 'chat': return chat(argv._[0]);
-  case 'send': return send(argv._[0], argv._.slice(1).join(' '));
-  case 'ask': return ask(argv._[0], argv._.slice(1).join(' '));
+  case 'send': return send(argv._);
+  case 'ask': return ask(argv._);
   case 'status': return argv.json ? jsonstatus() : status();
   default:
     console.error('unknown command "' + cmd + '", run `minnx --help` for usage');
@@ -139,11 +147,7 @@ function stop(procs, fn) {
   console.log();
 
   group.on('stopping', function(proc){
-    console.log(s('\033[36m%15s\033[m : stopping : %s', proc.name, proc.pid || 0));
-  });
-
-  group.on('stop', function(proc){
-    console.log(s('\033[36m%15s\033[m : standby : %s', proc.name, proc.pid || 0));
+    console.log(s('\033[36m%15s\033[m : stopping', proc.name));
   });
 
   group.stop(procs, null, function(err){
@@ -159,8 +163,11 @@ function stop(procs, fn) {
 
 function restart(procs) {
   stop(procs, function(){
+    console.log();
+    // re-hydrate group state after stop
+    group.windowInfo = group.queryWindows();
+    group.procs = group.processes();
     start(procs, function(){
-      console.log(s('\033[36m%15s\033[m : complete', 'restart'));
       console.log();
     });
   });
@@ -191,7 +198,7 @@ function chat(name) {
     process.exit(1);
   }
 
-  var target = session + ':' + name;
+  var target = proc.target();
   spawn('tmux', ['attach', '-t', target], { stdio: 'inherit' });
 }
 
@@ -199,91 +206,157 @@ function chat(name) {
  * Send a message to a running process.
  */
 
-function send(name, message) {
-  var session = group.session || 'minnx';
-
-  if (!name || !message) {
-    console.error('usage: minnx send <name> <message>');
-    process.exit(1);
-  }
-
-  var proc = group.procs.filter(function(p) { return p.name === name; })[0];
-  if (!proc) {
-    console.error('unknown process "' + name + '"');
-    process.exit(1);
-  }
-
-  if (!proc.alive()) {
-    console.error('"' + name + '" is not running');
-    process.exit(1);
-  }
-
-  var target = session + ':' + name;
+function send(args) {
   var exec = require('child_process').execSync;
-  exec('tmux send-keys -t ' + shellQuote(target) + ' ' + shellQuote(message) + ' Enter');
+
+  // determine if first arg is a process name or part of the message
+  var resolved = resolveTarget(args);
+  if (!resolved.message) {
+    console.error('usage: minnx send [name] <message>');
+    process.exit(1);
+  }
+
+  var targets = resolved.procs;
+  if (!targets.length) {
+    console.error('no running pi agents found');
+    process.exit(1);
+  }
+
+  targets.forEach(function(proc) {
+    var target = proc.target();
+    exec('tmux send-keys -t ' + shellQuote(target) + ' ' + shellQuote(resolved.message) + ' Enter');
+  });
 }
 
 /**
  * Send a message and print the streaming response.
  */
 
-function ask(name, message) {
+function ask(args) {
   var net = require('net');
-  var session = group.session || 'minnx';
 
-  if (!name || !message) {
-    console.error('usage: minnx ask <name> <message>');
+  // determine if first arg is a process name or part of the message
+  var resolved = resolveTarget(args);
+  if (!resolved.message) {
+    console.error('usage: minnx ask [name] <message>');
     process.exit(1);
   }
 
-  var proc = group.procs.filter(function(p) { return p.name === name; })[0];
-  if (!proc) {
-    console.error('unknown process "' + name + '"');
+  var targets = resolved.procs;
+  if (!targets.length) {
+    console.error('no running pi agents found');
     process.exit(1);
   }
 
-  if (!proc.alive()) {
-    console.error('"' + name + '" is not running');
-    process.exit(1);
+  var broadcast = targets.length > 1;
+  var nameW = 0;
+  if (broadcast) {
+    targets.forEach(function(p) {
+      if (p.name.length > nameW) nameW = p.name.length;
+    });
   }
 
-  var socketPath = path.resolve(path.join('sockets', name + '.sock'));
-  var client = net.connect(socketPath, function() {
-    client.write(JSON.stringify({ type: 'prompt', message: message }) + '\n');
-  });
+  var pending = targets.length;
 
-  var buf = '';
-  client.on('data', function(chunk) {
-    buf += chunk.toString();
-    var lines = buf.split('\n');
-    buf = lines.pop();
+  targets.forEach(function(proc) {
+    var socketPath = path.resolve(path.join('sockets', proc.name + '.sock'));
+    var client = net.connect(socketPath, function() {
+      client.write(JSON.stringify({ type: 'prompt', message: resolved.message }) + '\n');
+    });
 
-    lines.forEach(function(line) {
-      if (!line.trim()) return;
-      try {
-        var event = JSON.parse(line);
-        if (event.type === 'text_delta') {
-          process.stdout.write(event.delta);
-        } else if (event.type === 'done') {
-          process.stdout.write('\n');
-          client.end();
-        } else if (event.type === 'error') {
-          console.error(event.message);
-          client.end();
-          process.exit(1);
-        }
-      } catch (e) {}
+    var buf = '';
+    var first = true;
+    client.on('data', function(chunk) {
+      buf += chunk.toString();
+      var lines = buf.split('\n');
+      buf = lines.pop();
+
+      lines.forEach(function(line) {
+        if (!line.trim()) return;
+        try {
+          var event = JSON.parse(line);
+          if (event.type === 'text_delta') {
+            if (broadcast) {
+              // buffer the full response, print on done
+              if (!proc._response) proc._response = '';
+              proc._response += event.delta;
+            } else {
+              process.stdout.write(event.delta);
+            }
+          } else if (event.type === 'done') {
+            if (broadcast && proc._response) {
+              var lines = proc._response.trim().split('\n');
+              lines.forEach(function(line, i) {
+                if (i === 0) {
+                  console.log(s('\033[32m%' + nameW + 's\033[m : %s', proc.name, line));
+                } else {
+                  console.log(s('%' + nameW + 's   %s', '', line));
+                }
+              });
+            } else if (!broadcast) {
+              process.stdout.write('\n');
+            }
+            client.end();
+            pending--;
+            if (pending === 0) process.exit(0);
+          } else if (event.type === 'error') {
+            console.error(proc.name + ': ' + event.message);
+            client.end();
+            pending--;
+            if (pending === 0) process.exit(1);
+          }
+        } catch (e) {}
+      });
+    });
+
+    client.on('error', function(err) {
+      if (err.code === 'ENOENT') {
+        console.error('"' + proc.name + '" does not have a socket (is it a pi agent?)');
+      } else {
+        console.error(proc.name + ': ' + err.message);
+      }
+      pending--;
+      if (pending === 0) process.exit(1);
     });
   });
+}
 
-  client.on('error', function(err) {
-    if (err.code === 'ENOENT') {
-      console.error('"' + name + '" does not have a socket (is it a pi agent?)');
-    } else {
-      console.error('connection error: ' + err.message);
+/**
+ * Resolve target processes from args.
+ * If first arg matches a process name, target that one.
+ * Otherwise broadcast to all alive pi agents (those with sockets).
+ */
+
+function resolveTarget(args) {
+  if (!args.length) return { procs: [], message: '' };
+
+  var first = args[0];
+  var proc = group.procs.filter(function(p) { return p.name === first; })[0];
+
+  // first arg is a known process name
+  if (proc) {
+    var message = args.slice(1).join(' ');
+    if (!proc.alive()) {
+      console.error('"' + first + '" is not running');
+      process.exit(1);
     }
-    process.exit(1);
+    return { procs: [proc], message: message };
+  }
+
+  // broadcast to all alive pi agents with sockets
+  var message = args.join(' ');
+  var targets = group.procs.filter(function(p) {
+    if (!p.alive()) return false;
+    try {
+      var socketPath = path.resolve(path.join('sockets', p.name + '.sock'));
+      require('fs').accessSync(socketPath);
+      return true;
+    } catch (e) {
+      return false;
+    }
   });
+
+  return { procs: targets, message: message };
 }
 
 /**
@@ -323,10 +396,26 @@ function jsonstatus() {
  * Output process status.
  */
 
+function indicator(procState, agentState) {
+  // process-level states
+  if (procState === 'standby') return '\033[90m○\033[m';
+  if (procState === 'dead')    return '\033[31m●\033[m';
+
+  // agent-level states (process is alive)
+  switch (agentState) {
+    case 'working': return '\033[32m●\033[m';
+    case 'error':   return '\033[31m●\033[m';
+    case 'aborted': return '\033[33m●\033[m';
+    case 'stuck':   return '\033[31m○\033[m';
+    case 'idle':    return '\033[90m●\033[m';
+    default:        return '\033[90m●\033[m';
+  }
+}
+
 function status() {
   // first pass: collect row data and measure column widths
   var rows = [];
-  var widths = { name: 0, model: 0, state: 0, pid: 0, uptime: 0, cost: 0 };
+  var widths = { name: 0, model: 0, uptime: 0, cost: 0 };
 
   group.procs.forEach(function(proc) {
     var state = proc.state();
@@ -335,14 +424,14 @@ function status() {
       name: proc.name,
       model: (stats && stats.model) ? stats.model : '',
       state: state,
-      pid: proc.pid ? String(proc.pid) : '',
+      agentState: (stats && stats.state) ? stats.state : null,
       uptime: state === 'alive' ? ms(Date.now() - proc.mtime(), { long: true }) : '',
-      cost: (stats && stats.cost) ? '$' + stats.cost.toFixed(4) : ''
+      cost: (stats && stats.cost != null) ? '$' + stats.cost.toFixed(4) : ''
     };
     rows.push(row);
 
     for (var key in widths) {
-      if (row[key].length > widths[key]) widths[key] = row[key].length;
+      if (row[key] && row[key].length > widths[key]) widths[key] = row[key].length;
     }
   });
 
@@ -351,25 +440,31 @@ function status() {
 
   console.log();
   rows.forEach(function(row) {
-    var parts = [s('%' + nameW + 's', row.name)];
+    var name = s('%' + nameW + 's', row.name);
+    var nameColor = row.state === 'standby' ? '\033[33m' : row.state === 'dead' ? '\033[31m' : '\033[32m';
+    var parts = [nameColor + name + '\033[m'];
 
     if (widths.model > 0) {
-      parts.push(s('%-' + widths.model + 's', row.model));
+      parts.push('\033[90m' + s('%-' + widths.model + 's', row.model) + '\033[m');
     }
 
     switch (row.state) {
       case 'standby':
-        console.log('\033[33m' + parts[0] + '\033[m : ' + (parts[1] ? '\033[90m' + parts[1] + '\033[m : ' : '') + row.state);
-        break;
-      case 'alive':
-        var cells = [row.state, s('%-' + widths.pid + 's', row.pid), s('%-' + widths.uptime + 's', row.uptime)];
-        if (widths.cost > 0 && row.cost) cells.push(row.cost);
-        console.log('\033[32m' + parts[0] + '\033[m : ' + (parts[1] ? '\033[90m' + parts[1] + '\033[m : ' : '') + cells.join(' : '));
+        parts.push(row.state);
         break;
       case 'dead':
-        console.log('\033[31m' + parts[0] + '\033[m : ' + (parts[1] ? '\033[90m' + parts[1] + '\033[m : ' : '') + row.state);
+        parts.push(row.state);
+        break;
+      case 'alive':
+        var dot = indicator(row.state, row.agentState);
+        parts.push('\033[32m' + row.state + '\033[m');
+        parts.push(dot);
+        parts.push(s('%-' + widths.uptime + 's', row.uptime));
+        if (widths.cost > 0 && row.cost) parts.push(row.cost);
         break;
     }
+
+    console.log(parts.join(' \033[90m:\033[m '));
   });
   console.log();
 }
