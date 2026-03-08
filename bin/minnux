@@ -20,7 +20,7 @@ var argv = minimist(process.argv.slice(2), {
   string: ['config'],
   boolean: ['json', 'help', 'version'],
   alias: { c: 'config', j: 'json', h: 'help', v: 'version' },
-  default: { config: 'minnux.conf' }
+  default: { config: 'mx.conf' }
 });
 
 // version
@@ -38,7 +38,7 @@ if (argv.help) {
   console.log();
   console.log('  Options:');
   console.log();
-  console.log('    -c, --config <path>  load configuration [./minnux.conf]');
+  console.log('    -c, --config <path>  load configuration [./mx.conf]');
   console.log('    -j, --json           output json');
   console.log('    -v, --version        output version');
   console.log('    -h, --help           output help');

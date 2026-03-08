@@ -1,6 +1,6 @@
 {
   "name": "minnux",
-  "version": "0.0.0",
+  "version": "0.0.2",
   "description": "runner for agents",
   "author": "Brock Whitten <brock@sintaxi.com>",
   "license": "ISC",

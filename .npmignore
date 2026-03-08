@@ -2,6 +2,6 @@ test
 logs
 sockets
 stats
-minnux.conf
+mx.conf
 .DS_Store
 *.swp
