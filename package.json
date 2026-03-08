@@ -4,6 +4,9 @@
   "description": "runner for agents",
   "author": "Brock Whitten <brock@sintaxi.com>",
   "license": "ISC",
+  "scripts": {
+    "version": "npm publish"
+  },
   "dependencies": {
     "minimist": "^1.2.8",
     "ms": "^2.1.3",
